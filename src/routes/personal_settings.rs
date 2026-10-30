@@ -128,8 +128,9 @@ pub async fn podcast_data(
         .get_cached_or_fetch(url)
         .await
         .map_err(|err| {
+            // Details stay in the log: they can reveal how internal hosts resolve.
             tracing::warn!("failed to fetch podcast data for {url}: {err}");
-            ApiError::internal(err.to_string())
+            ApiError::internal("Failed to fetch podcast data")
         })?;
     Ok(PhpJson::ok(json!({ "data": data })))
 }

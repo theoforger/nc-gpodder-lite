@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const API: &str = "/index.php/apps/gpoddersync";
+const ORIGIN: &str = "https://pods.example.com";
 
 struct TestServer {
     app: Router,
@@ -35,6 +36,7 @@ fn server() -> TestServer {
         Config {
             public_url: Some("https://pods.example.com".into()),
             allow_local_remote_servers: false,
+            trusted_proxies: Vec::new(),
         },
     );
     TestServer {
@@ -99,10 +101,64 @@ impl TestServer {
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(header::USER_AGENT, "AntennaPod/3.5");
         if let Some(cookie) = cookie {
-            req = req.header(header::COOKIE, cookie);
+            // Browsers send Origin with form POSTs; cookie-authenticated POSTs need a same-origin one.
+            req = req
+                .header(header::COOKIE, cookie)
+                .header(header::ORIGIN, ORIGIN);
         }
         self.send(req.body(Body::from(body.to_owned())).unwrap())
             .await
+    }
+
+    /// Logs into the web UI and returns the session cookie (`name=value`).
+    async fn web_login(&self, username: &str, password: &str) -> Result<String, StatusCode> {
+        let res = self
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "username={username}&password={password}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if res.status() != StatusCode::SEE_OTHER {
+            return Err(res.status());
+        }
+        let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        Ok(cookie.split(';').next().unwrap().to_owned())
+    }
+
+    /// Completes Login Flow v2 as `alice` and returns the issued app password.
+    async fn app_password_via_login_flow(&self) -> String {
+        let init = self.post_form("/index.php/login/v2", "", None).await.json();
+        let poll_token = init["poll"]["token"].as_str().unwrap().to_owned();
+        let flow_token = init["login"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let res = self
+            .post_form(
+                "/index.php/login/v2/grant",
+                &format!("flow_token={flow_token}&username=alice&password=secret-pw"),
+                None,
+            )
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text);
+        let res = self
+            .post_form(
+                "/index.php/login/v2/poll",
+                &format!("token={poll_token}"),
+                None,
+            )
+            .await;
+        res.json()["appPassword"].as_str().unwrap().to_owned()
     }
 
     async fn actions(&self, query: &str) -> Vec<Value> {
@@ -562,4 +618,330 @@ async fn web_login_and_settings() {
         .await;
     assert_eq!(res.status, StatusCode::OK);
     assert!(res.text.contains("Kasts"));
+}
+
+// Security regression tests (see the security audit fixes).
+
+#[tokio::test]
+async fn app_password_cannot_unlock_web_ui_or_grant() {
+    let s = server();
+    let app_password = s.app_password_via_login_flow().await;
+
+    // No web login with an app password...
+    assert_eq!(
+        s.web_login("alice", &app_password).await,
+        Err(StatusCode::FORBIDDEN)
+    );
+
+    // ...no password change with one, even from a valid session...
+    let cookie = s.web_login("alice", "secret-pw").await.unwrap();
+    let res = s
+        .post_form(
+            "/settings/password",
+            &format!("current={app_password}&new=attacker-pw-1"),
+            Some(&cookie),
+        )
+        .await;
+    assert!(res.text.contains("The current password is wrong."));
+    assert_eq!(
+        s.get_as(
+            &basic("alice", "secret-pw"),
+            &format!("{API}/subscriptions")
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    // ...and no granting a new login flow with one.
+    let init = s.post_form("/index.php/login/v2", "", None).await.json();
+    let flow_token = init["login"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let res = s
+        .post_form(
+            "/index.php/login/v2/grant",
+            &format!("flow_token={flow_token}&username=alice&password={app_password}"),
+            None,
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // The app password still works for syncing.
+    assert_eq!(
+        s.get_as(
+            &basic("alice", &app_password),
+            &format!("{API}/subscriptions")
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn cookie_authenticated_writes_require_same_origin() {
+    let s = server();
+    let cookie = s.web_login("alice", "secret-pw").await.unwrap();
+    let unsubscribe = |origin: Option<&str>| {
+        let mut req = Request::post(format!("{API}/subscription_change/create"))
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "text/plain");
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        req.body(Body::from(
+            r#"{"add":[],"remove":["https://x.example/feed"]}"#,
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        s.send(unsubscribe(Some("https://evil.example.com")))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.send(unsubscribe(None)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.send(unsubscribe(Some(ORIGIN))).await.status,
+        StatusCode::OK
+    );
+
+    // A Referer from this server is accepted when Origin is absent.
+    let res = s
+        .send(
+            Request::post("/settings/app-passwords")
+                .header(header::COOKIE, &cookie)
+                .header(header::REFERER, format!("{ORIGIN}/settings"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Laptop"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Cross-origin login (login CSRF) is rejected too.
+    let res = s
+        .send(
+            Request::post("/login")
+                .header(header::ORIGIN, "https://evil.example.com")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("username=alice&password=secret-pw"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Podcast clients (Basic auth, no cookie, no Origin) are unaffected.
+    let res = s
+        .post_json(
+            &format!("{API}/subscription_change/create"),
+            json!({"add": ["https://a.example/feed"], "remove": []}),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn login_flow_grant_always_requires_password() {
+    let s = server();
+    let cookie = s.web_login("alice", "secret-pw").await.unwrap();
+    let init = s.post_form("/index.php/login/v2", "", None).await.json();
+    let poll_token = init["poll"]["token"].as_str().unwrap().to_owned();
+    let flow_token = init["login"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // A session alone (same origin, no password) can't grant access.
+    let res = s
+        .post_form(
+            "/index.php/login/v2/grant",
+            &format!("flow_token={flow_token}"),
+            Some(&cookie),
+        )
+        .await;
+    assert_ne!(res.status, StatusCode::OK);
+    let res = s
+        .post_form(
+            "/index.php/login/v2/poll",
+            &format!("token={poll_token}"),
+            None,
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // A flow can only be granted once.
+    let grant = format!("flow_token={flow_token}&username=alice&password=secret-pw");
+    assert_eq!(
+        s.post_form("/index.php/login/v2/grant", &grant, None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s.post_form("/index.php/login/v2/grant", &grant, None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn pages_cannot_be_framed_and_have_csp() {
+    let s = server();
+    let init = s.post_form("/index.php/login/v2", "", None).await.json();
+    let flow_path = init["login"]
+        .as_str()
+        .unwrap()
+        .strip_prefix(ORIGIN)
+        .unwrap()
+        .to_owned();
+    let res = s
+        .app
+        .clone()
+        .oneshot(Request::get(&flow_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let headers = res.headers();
+    assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+    assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    // Not `no-referrer`: browsers would then send `Origin: null` on the page's own
+    // form posts, and the CSRF check would reject them.
+    assert_eq!(headers[header::REFERRER_POLICY], "same-origin");
+    let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("script-src 'nonce-"));
+    let body =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(body.contains("Only continue if you just started connecting an app yourself."));
+    assert!(body.contains(r#"<meta name="referrer" content="same-origin">"#));
+
+    // API responses get the generic headers too.
+    let res = s
+        .app
+        .clone()
+        .oneshot(Request::get("/status.php").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+}
+
+#[tokio::test]
+async fn repeated_login_failures_are_throttled() {
+    let s = server();
+    let app_password = s.app_password_via_login_flow().await;
+    let wrong = basic("alice", "wrong");
+    let path = format!("{API}/subscriptions");
+    // Concurrent attempts must not slip past the limit of 10 per username.
+    let mut attempts = tokio::task::JoinSet::new();
+    for _ in 0..15 {
+        let request = Request::get(&path)
+            .header(header::AUTHORIZATION, &wrong)
+            .body(Body::empty())
+            .unwrap();
+        attempts.spawn(s.app.clone().oneshot(request));
+    }
+    let mut statuses = Vec::new();
+    while let Some(res) = attempts.join_next().await {
+        statuses.push(res.unwrap().unwrap().status());
+    }
+    let count = |status| statuses.iter().filter(|s| **s == status).count();
+    assert_eq!(count(StatusCode::UNAUTHORIZED), 10, "{statuses:?}");
+    assert_eq!(count(StatusCode::TOO_MANY_REQUESTS), 5, "{statuses:?}");
+
+    // Further attempts are refused, even with the right password...
+    let res = s.get(&path).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        s.web_login("alice", "secret-pw").await,
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    );
+    // ...but app passwords keep working, so synced devices aren't locked out.
+    assert_eq!(
+        s.get_as(&basic("alice", &app_password), &path).await.status,
+        StatusCode::OK
+    );
+    // Other users are unaffected.
+    assert_eq!(
+        s.get_as(&basic("bob", "bob-pw"), &path).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn password_change_logs_out_other_sessions() {
+    let s = server();
+    let current = s.web_login("alice", "secret-pw").await.unwrap();
+    let other = s.web_login("alice", "secret-pw").await.unwrap();
+    let res = s
+        .post_form(
+            "/settings/password",
+            "current=secret-pw&new=new-password-1",
+            Some(&current),
+        )
+        .await;
+    assert!(res.text.contains("Password changed."), "{}", res.text);
+
+    let settings = |cookie: &str| {
+        Request::get("/settings")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(s.send(settings(&current)).await.status, StatusCode::OK);
+    assert_eq!(s.send(settings(&other)).await.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn large_bodies_only_allowed_for_sync_uploads() {
+    let s = server();
+    let big = "a".repeat(3 * 1024 * 1024);
+    let res = s
+        .send(
+            Request::post("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("username=alice&password={big}")))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let urls: Vec<String> = (0..40_000)
+        .map(|i| format!("https://example.com/podcast/{i:08}/feed.xml"))
+        .collect();
+    let res = s
+        .post_json(
+            &format!("{API}/subscription_change/create"),
+            json!({"add": urls, "remove": []}),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn podcast_data_fetch_errors_are_generic() {
+    let s = server();
+    s.post_json(
+        &format!("{API}/subscription_change/create"),
+        json!({"add": ["http://127.0.0.1:9/feed.xml"], "remove": []}),
+    )
+    .await;
+    let res = s
+        .get(&format!(
+            "{API}/personal_settings/podcast_data?url=http%3A%2F%2F127.0.0.1%3A9%2Ffeed.xml"
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(res.text, r#"{"message":"Failed to fetch podcast data"}"#);
 }

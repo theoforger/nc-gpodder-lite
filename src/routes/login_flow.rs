@@ -2,26 +2,35 @@
 //! https://docs.nextcloud.com/server/latest/developer_manual/client_apis/LoginFlow/index.html#login-flow-v2
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Form;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
-use rusqlite::{OptionalExtension, params};
+use axum::http::{Extensions, HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::web::{esc, layout};
+use super::web::{esc, layout, login_error_status};
 use crate::AppState;
-use crate::auth::{AuthUser, check_credentials, random_token, session_user};
+use crate::auth::{Credentials, authenticate, random_token, session_user};
 use crate::db::now;
 use crate::json::{ApiError, PhpJson};
+use crate::security::{client_ip, peer_addr};
 use crate::users::create_app_password;
 
 /// Nextcloud expires login flows after 20 minutes.
 const FLOW_LIFETIME_SECS: i64 = 20 * 60;
+
+/// Deletes expired flows, including granted-but-never-polled ones, which still
+/// hold a plaintext app password.
+pub fn purge_expired_login_flows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM login_flows WHERE created_at < ?1",
+        [now() - FLOW_LIFETIME_SECS],
+    )
+}
 
 pub async fn init(
     State(state): State<Arc<AppState>>,
@@ -36,10 +45,7 @@ pub async fn init(
         .unwrap_or("unknown client")
         .to_owned();
     state.db.with(|conn| -> rusqlite::Result<()> {
-        conn.execute(
-            "DELETE FROM login_flows WHERE created_at < ?1",
-            [now() - FLOW_LIFETIME_SECS],
-        )?;
+        purge_expired_login_flows(conn)?;
         conn.execute(
             "INSERT INTO login_flows (poll_token, flow_token, client_name, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -68,6 +74,7 @@ pub async fn poll(
 ) -> Result<PhpJson, ApiError> {
     let token = poll_token(query.as_deref(), &body);
     let granted = state.db.with(|conn| -> rusqlite::Result<_> {
+        purge_expired_login_flows(conn)?;
         let found: Option<(String, String)> = conn
             .query_row(
                 "SELECT login_name, app_password FROM login_flows
@@ -125,7 +132,7 @@ fn invalid_flow_page() -> Response {
         StatusCode::NOT_FOUND,
         layout(
             "Login link expired",
-            "<p>This login link is invalid or has expired. Start the login again from your app.</p>",
+            "<p>This login link is invalid, expired, or already used. Start the login again from your app.</p>",
         ),
     )
         .into_response()
@@ -134,29 +141,24 @@ fn invalid_flow_page() -> Response {
 fn grant_form(
     flow_token: &str,
     client: &str,
-    session: Option<&AuthUser>,
+    username: Option<&str>,
     error: Option<&str>,
-) -> Html<String> {
+) -> Response {
     let error = error
         .map(|e| format!(r#"<p class="error">{}</p>"#, esc(e)))
         .unwrap_or_default();
-    let credentials = match session {
-        Some(user) => format!(
-            "<p>You are logged in as <strong>{}</strong>.</p>",
-            esc(&user.username)
-        ),
-        None => r#"<label>Username <input name="username" autocomplete="username" required autofocus></label>
-<label>Password <input name="password" type="password" autocomplete="current-password" required></label>"#
-            .to_owned(),
-    };
+    let username = username.map(esc).unwrap_or_default();
     layout(
-        "Connect to your account",
+        "Connect an app to your account",
         &format!(
-            r#"<p><strong>{client}</strong> wants to access your podcast sync data.</p>
+            r#"<p>An app that identifies itself as <strong>{client}</strong> is asking for access to your podcast subscriptions and listening history.</p>
+<p class="error"><strong>Only continue if you just started connecting an app yourself.</strong> If someone sent you this link, close this page: granting access would give them your sync data.</p>
+<p class="muted">Access is granted through a new app password, which you can revoke later on the settings page.</p>
 {error}
 <form method="post" action="../grant">
 <input type="hidden" name="flow_token" value="{token}">
-{credentials}
+<label>Username <input name="username" value="{username}" autocomplete="username" required></label>
+<label>Password <input name="password" type="password" autocomplete="current-password" required autofocus></label>
 <button type="submit">Grant access</button>
 </form>"#,
             client = esc(client),
@@ -174,50 +176,69 @@ pub async fn page(
         return Ok(invalid_flow_page());
     };
     let session = session_user(&state, &headers);
-    Ok(grant_form(&flow_token, &client, session.as_ref(), None).into_response())
+    let username = session.as_ref().map(|u| u.username.as_str());
+    Ok(grant_form(&flow_token, &client, username, None))
 }
 
 #[derive(Deserialize)]
 pub struct GrantForm {
     flow_token: String,
-    username: Option<String>,
-    password: Option<String>,
+    username: String,
+    password: String,
 }
 
+/// Grants access. The account password is always required, even with a session:
+/// a one-click grant could be triggered by clickjacking or a same-site forged
+/// request, handing an app password to whoever started the flow.
 pub async fn grant(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: Extensions,
     Form(form): Form<GrantForm>,
 ) -> Result<Response, ApiError> {
     let Some(client) = pending_flow_client(&state, &form.flow_token)? else {
         return Ok(invalid_flow_page());
     };
 
-    let session = session_user(&state, &headers);
-    let user = match (&form.username, &form.password) {
-        (Some(username), Some(password)) => check_credentials(&state, username, password).await,
-        _ => session.clone(),
-    };
-    let Some(user) = user else {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let page = grant_form(
-            &form.flow_token,
-            &client,
-            session.as_ref(),
-            Some("Wrong username or password."),
-        );
-        return Ok((StatusCode::FORBIDDEN, page).into_response());
+    let ip = client_ip(&state, &headers, peer_addr(&extensions));
+    let user = match authenticate(
+        &state,
+        ip,
+        &form.username,
+        &form.password,
+        Credentials::AccountPasswordOnly,
+    )
+    .await
+    {
+        Ok(user) => user,
+        Err(err) => {
+            let (status, message) = login_error_status(&err);
+            let page = grant_form(
+                &form.flow_token,
+                &client,
+                Some(&form.username),
+                Some(message),
+            );
+            return Ok((status, page).into_response());
+        }
     };
 
-    state.db.with(|conn| -> rusqlite::Result<()> {
+    let granted = state.db.with(|conn| -> rusqlite::Result<bool> {
         let tx = conn.transaction()?;
         let app_password = create_app_password(&tx, user.id, &client)?;
-        tx.execute(
-            "UPDATE login_flows SET login_name = ?1, app_password = ?2 WHERE flow_token = ?3",
+        let granted = tx.execute(
+            "UPDATE login_flows SET login_name = ?1, app_password = ?2
+             WHERE flow_token = ?3 AND app_password IS NULL",
             params![user.username, app_password, form.flow_token],
-        )?;
-        tx.commit()
+        )? > 0;
+        if granted {
+            tx.commit()?;
+        }
+        Ok(granted)
     })?;
+    if !granted {
+        return Ok(invalid_flow_page());
+    }
 
     Ok(layout(
         "Account connected",
@@ -225,6 +246,5 @@ pub async fn grant(
             "<p><strong>{}</strong> is now connected to your account. You can close this window and return to the app.</p>",
             esc(&client)
         ),
-    )
-    .into_response())
+    ))
 }

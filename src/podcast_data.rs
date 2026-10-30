@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use quick_xml::events::Event;
@@ -34,10 +34,92 @@ pub struct PodcastData {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// How long fetched podcast data is reused before it's fetched again.
+const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Upper bound on the memory used by cached podcast data (mostly inlined images).
+const CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
 pub struct PodcastDataReader {
     client: Client,
     allow_local: bool,
-    cache: Mutex<HashMap<String, PodcastData>>,
+    cache: Mutex<Cache>,
+}
+
+/// Podcast data by feed URL, expiring after [`CACHE_TTL`] and evicting the oldest
+/// entries once the total size exceeds [`CACHE_MAX_BYTES`].
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, CacheEntry>,
+    total_bytes: usize,
+}
+
+struct CacheEntry {
+    data: PodcastData,
+    inserted: Instant,
+    size: usize,
+}
+
+impl Cache {
+    fn get(&mut self, url: &str) -> Option<PodcastData> {
+        let entry = self.entries.get(url)?;
+        if entry.inserted.elapsed() < CACHE_TTL {
+            return Some(entry.data.clone());
+        }
+        self.remove(url);
+        None
+    }
+
+    fn insert(&mut self, url: String, data: PodcastData) {
+        let size = url.len() + data.approximate_size();
+        if size > CACHE_MAX_BYTES {
+            return;
+        }
+        self.remove(&url);
+        self.entries.retain(|_, e| e.inserted.elapsed() < CACHE_TTL);
+        self.total_bytes = self.entries.values().map(|e| e.size).sum();
+        while self.total_bytes + size > CACHE_MAX_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.inserted)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+        self.total_bytes += size;
+        self.entries.insert(
+            url,
+            CacheEntry {
+                data,
+                inserted: Instant::now(),
+                size,
+            },
+        );
+    }
+
+    fn remove(&mut self, url: &str) {
+        if let Some(entry) = self.entries.remove(url) {
+            self.total_bytes -= entry.size;
+        }
+    }
+}
+
+impl PodcastData {
+    fn approximate_size(&self) -> usize {
+        [
+            &self.title,
+            &self.author,
+            &self.link,
+            &self.description,
+            &self.image_url,
+            &self.image_blob,
+        ]
+        .iter()
+        .map(|s| s.as_ref().map_or(0, String::len))
+        .sum()
+    }
 }
 
 impl PodcastDataReader {
@@ -56,17 +138,21 @@ impl PodcastDataReader {
                     }
                 }));
         if !allow_local {
-            builder = builder.dns_resolver(Arc::new(PublicOnlyResolver));
+            // A proxy would resolve hostnames itself, bypassing the resolver's
+            // address check, so ignore HTTP(S)_PROXY from the environment.
+            builder = builder
+                .dns_resolver(Arc::new(PublicOnlyResolver))
+                .no_proxy();
         }
         PodcastDataReader {
             client: builder.build().expect("failed to build HTTP client"),
             allow_local,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
         }
     }
 
     pub fn cached(&self, url: &str) -> Option<PodcastData> {
-        self.cache.lock().unwrap().get(url).cloned()
+        self.cache.lock().unwrap().get(url)
     }
 
     /// Returns cached data or fetches it. The caller must already have checked
@@ -374,10 +460,7 @@ fn is_allowed_url(url: &Url) -> bool {
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_ipv4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => is_public_ipv4(v4),
-            None => is_public_ipv6(v6),
-        },
+        IpAddr::V6(v6) => is_public_ipv6(v6),
     }
 }
 
@@ -396,12 +479,30 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_public_ipv6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
+    let seg = ip.segments();
+    let embedded_v4 = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses.
+    if let Some(v4) = ip.to_ipv4() {
+        return is_public_ipv4(v4);
+    }
+    // 6to4 (2002::/16) embeds an IPv4 address in bits 16..48.
+    if seg[0] == 0x2002 {
+        return is_public_ipv4(embedded_v4(seg[1], seg[2]));
+    }
+    // NAT64 (64:ff9b::/96) embeds an IPv4 address in the last 32 bits.
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return is_public_ipv4(embedded_v4(seg[6], seg[7]));
+    }
     !(ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || (first & 0xfe00) == 0xfc00
-        || (first & 0xffc0) == 0xfe80)
+        || (seg[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+        || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        || (seg[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
+        || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // local-use NAT64 64:ff9b:1::/48
+        || (seg[0] == 0x2001 && seg[1] == 0) // Teredo 2001::/32
+        || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
+        || seg[0] == 0x100 && seg[1..4] == [0, 0, 0]) // discard-only 100::/64
 }
 
 /// DNS resolver that drops loopback/private addresses, like Nextcloud's HTTP
@@ -483,11 +584,45 @@ mod tests {
     }
 
     #[test]
+    fn cache_expires_and_is_bounded() {
+        let data = |blob_len: usize| PodcastData {
+            title: None,
+            author: None,
+            link: None,
+            description: None,
+            image_url: None,
+            image_blob: Some("x".repeat(blob_len)),
+            fetched_at_unix: 0,
+        };
+        let mut cache = Cache::default();
+        let big = CACHE_MAX_BYTES / 3;
+        for i in 0..5 {
+            cache.insert(format!("u{i}"), data(big));
+        }
+        assert!(cache.total_bytes <= CACHE_MAX_BYTES);
+        assert!(cache.get("u0").is_none(), "oldest entries are evicted");
+        assert!(cache.get("u4").is_some());
+        cache.insert("too-big".into(), data(CACHE_MAX_BYTES + 1));
+        assert!(cache.get("too-big").is_none());
+
+        cache.entries.get_mut("u4").unwrap().inserted -= CACHE_TTL;
+        assert!(cache.get("u4").is_none(), "expired entries are dropped");
+    }
+
+    #[test]
     fn classifies_ips() {
         assert!(!is_public_ip("127.0.0.1".parse().unwrap()));
         assert!(!is_public_ip("10.1.2.3".parse().unwrap()));
         assert!(!is_public_ip("::1".parse().unwrap()));
         assert!(!is_public_ip("::ffff:192.168.0.1".parse().unwrap()));
+        assert!(!is_public_ip("::127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("2002:c0a8:0001::1".parse().unwrap()));
+        assert!(!is_public_ip("64:ff9b::10.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("fec0::1".parse().unwrap()));
+        assert!(!is_public_ip("2001:db8::1".parse().unwrap()));
         assert!(is_public_ip("1.1.1.1".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+        assert!(is_public_ip("2002:0101:0101::1".parse().unwrap()));
+        assert!(is_public_ip("64:ff9b::1.1.1.1".parse().unwrap()));
     }
 }

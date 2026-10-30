@@ -5,16 +5,18 @@ mod status;
 mod subscription;
 mod web;
 
+pub use login_flow::purge_expired_login_flows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use axum::{Router, middleware};
 use tower_http::trace::TraceLayer;
 
-use crate::AppState;
 use crate::json::ApiError;
+use crate::{AppState, security};
 
 pub fn router(state: Arc<AppState>) -> Router {
     // Nextcloud serves everything both with and without the `/index.php` prefix.
@@ -25,12 +27,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/apps/gpoddersync/episode_action/create",
-            post(episode_action::create),
+            post(episode_action::create).layer(DefaultBodyLimit::max(SYNC_UPLOAD_LIMIT)),
         )
         .route("/apps/gpoddersync/subscriptions", get(subscription::list))
         .route(
             "/apps/gpoddersync/subscription_change/create",
-            post(subscription::create),
+            post(subscription::create).layer(DefaultBodyLimit::max(SYNC_UPLOAD_LIMIT)),
         )
         .route(
             "/apps/gpoddersync/personal_settings/metrics",
@@ -50,10 +52,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/index.php", nextcloud)
         .route("/status.php", get(status::status))
         .merge(web::router())
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security::csrf_protection,
+        ))
+        .layer(middleware::from_fn(security::security_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
+
+/// Body limit for sync uploads, which can be large on a client's first sync.
+/// Every other route keeps axum's default limit of 2 MB.
+const SYNC_UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Reads an `int` controller parameter the way Nextcloud coerces it: numeric
 /// strings are truncated to integers, anything else is rejected.

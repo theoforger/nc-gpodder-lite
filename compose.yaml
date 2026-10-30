@@ -9,6 +9,9 @@ services:
       # Public base URL clients use to reach the server (e.g. https://pods.example.com).
       # If empty, it's derived from the Host / X-Forwarded-* request headers.
       NCGL_PUBLIC_URL: ${NCGL_PUBLIC_URL:-}
+      # Reverse proxies (IPs/CIDR ranges, comma-separated) whose X-Forwarded-For
+      # header gives the real client IP for login throttling.
+      NCGL_TRUSTED_PROXIES: ${NCGL_TRUSTED_PROXIES:-}
       RUST_LOG: ${RUST_LOG:-nc_gpodder_lite=info,tower_http=info}
     volumes:
       - data:/data

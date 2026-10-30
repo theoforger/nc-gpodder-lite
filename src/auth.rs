@@ -2,7 +2,8 @@
 //! the account password or an app password (as issued by Login Flow v2), plus a
 //! session cookie for the web UI.
 
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use argon2::Argon2;
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::db::now;
 use crate::json::PhpJson;
+use crate::security::{TooManyAttempts, client_ip, peer_addr};
 
 pub const SESSION_COOKIE: &str = "ncgl_session";
 pub const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
@@ -58,12 +60,38 @@ pub fn sha256_hex(input: &str) -> String {
         .collect()
 }
 
-/// Checks a username plus either the account password or one of the user's app passwords.
-pub async fn check_credentials(
+/// Which secrets a login form or endpoint accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Credentials {
+    /// The account password or an app password. Used by the sync API.
+    AnyPassword,
+    /// Only the account password. App passwords are meant for a single device and
+    /// must not unlock the web UI, issue new app passwords, or change the password.
+    AccountPasswordOnly,
+}
+
+pub enum LoginError {
+    Invalid,
+    Throttled,
+}
+
+/// Argon2 hash checked when the username doesn't exist, so the response takes as
+/// long as for a wrong password and doesn't reveal which usernames exist.
+fn dummy_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| hash_password("dummy password for timing equalization"))
+}
+
+/// Checks a username and password. Failed account-password attempts are counted
+/// per username and client IP and delayed; once too many accumulate, further
+/// attempts fail with [`LoginError::Throttled`] without checking the password.
+pub async fn authenticate(
     state: &AppState,
+    client_ip: Option<IpAddr>,
     username: &str,
     password: &str,
-) -> Option<AuthUser> {
+    accepted: Credentials,
+) -> Result<AuthUser, LoginError> {
     let token_hash = sha256_hex(password);
     let lookup = state.db.with(|conn| -> rusqlite::Result<_> {
         let Some((id, password_hash)) = conn
@@ -76,32 +104,48 @@ pub async fn check_credentials(
         else {
             return Ok(None);
         };
-        let app_password_used = conn.execute(
-            "UPDATE app_passwords SET last_used = ?1 WHERE user_id = ?2 AND token_hash = ?3",
-            params![now(), id, token_hash],
-        )? > 0;
+        let app_password_used = accepted == Credentials::AnyPassword
+            && conn.execute(
+                "UPDATE app_passwords SET last_used = ?1 WHERE user_id = ?2 AND token_hash = ?3",
+                params![now(), id, token_hash],
+            )? > 0;
         Ok(Some((id, password_hash, app_password_used)))
     });
-    let (id, password_hash, app_password_used) = match lookup {
-        Ok(Some(found)) => found,
-        Ok(None) => return None,
-        Err(err) => {
-            tracing::error!("database error during login: {err}");
-            return None;
-        }
-    };
-    let user = AuthUser {
-        id,
-        username: username.to_owned(),
-    };
-    if app_password_used {
-        return Some(user);
+    let found = lookup.unwrap_or_else(|err| {
+        tracing::error!("database error during login: {err}");
+        None
+    });
+    if let Some((id, _, true)) = found {
+        return Ok(AuthUser {
+            id,
+            username: username.to_owned(),
+        });
     }
+
+    if !state.login_throttle.begin_attempt(username, client_ip) {
+        return Err(LoginError::Throttled);
+    }
+    let hash = found
+        .as_ref()
+        .map_or_else(|| dummy_hash().to_owned(), |(_, hash, _)| hash.clone());
     let password = password.to_owned();
-    let valid = tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+    let valid = tokio::task::spawn_blocking(move || verify_password(&password, &hash))
         .await
         .unwrap_or(false);
-    valid.then_some(user)
+    match found {
+        Some((id, _, _)) if valid => {
+            state.login_throttle.record_success(username, client_ip);
+            Ok(AuthUser {
+                id,
+                username: username.to_owned(),
+            })
+        }
+        _ => {
+            // Slow down password guessing, like Nextcloud's brute-force protection.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(LoginError::Invalid)
+        }
+    }
 }
 
 fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
@@ -172,20 +216,22 @@ impl IntoResponse for NotLoggedIn {
 }
 
 impl FromRequestParts<Arc<AppState>> for AuthUser {
-    type Rejection = NotLoggedIn;
+    type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         if let Some((username, password)) = basic_credentials(&parts.headers) {
-            if let Some(user) = check_credentials(state, &username, &password).await {
-                return Ok(user);
-            }
-            // Slow down password guessing, like Nextcloud's brute-force protection.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            return Err(NotLoggedIn);
+            let ip = client_ip(state, &parts.headers, peer_addr(&parts.extensions));
+            return match authenticate(state, ip, &username, &password, Credentials::AnyPassword)
+                .await
+            {
+                Ok(user) => Ok(user),
+                Err(LoginError::Invalid) => Err(NotLoggedIn.into_response()),
+                Err(LoginError::Throttled) => Err(TooManyAttempts.into_response()),
+            };
         }
-        session_user(state, &parts.headers).ok_or(NotLoggedIn)
+        session_user(state, &parts.headers).ok_or_else(|| NotLoggedIn.into_response())
     }
 }

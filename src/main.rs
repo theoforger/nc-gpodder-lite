@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use nc_gpodder_lite::db::Db;
+use nc_gpodder_lite::security::IpNet;
 use nc_gpodder_lite::{AppState, Config, app, users};
 
 /// Standalone sync server compatible with the nextcloud-gpodder (gpoddersync) Nextcloud app.
@@ -39,6 +40,10 @@ enum Command {
         /// Allow fetching podcast feeds and images from loopback/private addresses.
         #[arg(long, env = "NCGL_ALLOW_LOCAL_REMOTE_SERVERS")]
         allow_local_remote_servers: bool,
+        /// Reverse proxies (IPs or CIDR ranges, comma-separated) whose
+        /// X-Forwarded-For header identifies the real client IP for login throttling.
+        #[arg(long, env = "NCGL_TRUSTED_PROXIES", value_parser = parse_ip_nets, default_value = "")]
+        trusted_proxies: IpNets,
     },
     /// Manage user accounts.
     #[command(subcommand)]
@@ -55,6 +60,20 @@ enum UserCommand {
     Delete { username: String },
     /// List users.
     List,
+}
+
+#[derive(Clone)]
+struct IpNets(Vec<IpNet>);
+
+/// Comma-separated IPs/CIDR ranges; empty entries (e.g. an empty env var) are ignored.
+fn parse_ip_nets(value: &str) -> Result<IpNets, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map(IpNets)
 }
 
 fn read_password() -> io::Result<String> {
@@ -164,10 +183,12 @@ async fn main() -> ExitCode {
             listen,
             public_url,
             allow_local_remote_servers,
+            trusted_proxies,
         } => {
             let config = Config {
                 public_url,
                 allow_local_remote_servers,
+                trusted_proxies: trusted_proxies.0,
             };
             let state = Arc::new(AppState::new(db, config));
             let listener = match tokio::net::TcpListener::bind(listen).await {
@@ -178,7 +199,8 @@ async fn main() -> ExitCode {
                 }
             };
             tracing::info!("listening on http://{listen}");
-            if let Err(err) = axum::serve(listener, app(state))
+            let service = app(state).into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(err) = axum::serve(listener, service)
                 .with_graceful_shutdown(shutdown_signal())
                 .await
             {

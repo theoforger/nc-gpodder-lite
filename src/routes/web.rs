@@ -3,10 +3,9 @@
 //! and password change.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -16,10 +15,12 @@ use serde::Deserialize;
 use super::personal_settings::podcast_metrics;
 use crate::AppState;
 use crate::auth::{
-    SESSION_COOKIE, check_credentials, cookie, random_token, session_user, sha256_hex,
+    Credentials, LoginError, SESSION_COOKIE, authenticate, cookie, random_token, session_user,
+    sha256_hex,
 };
 use crate::db::now;
 use crate::json::ApiError;
+use crate::security::{client_ip, peer_addr};
 use crate::users;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -40,16 +41,31 @@ pub fn esc(s: &str) -> String {
     html_escape::encode_double_quoted_attribute(s).into_owned()
 }
 
-pub fn layout(title: &str, body: &str) -> Html<String> {
-    Html(format!(
+pub fn layout(title: &str, body: &str) -> Response {
+    page(title, body, None)
+}
+
+/// Renders an HTML page with a strict Content-Security-Policy. Inline style and
+/// script are allowed only through a per-response nonce.
+pub fn page(title: &str, body: &str, script: Option<&str>) -> Response {
+    let nonce = random_token(32);
+    let script = script
+        .map(|s| format!(r#"<script nonce="{nonce}">{s}</script>"#))
+        .unwrap_or_default();
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; \
+         base-uri 'none'"
+    );
+    let html = Html(format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
+<meta name="referrer" content="same-origin">
 <title>{title} · nc-gpodder-lite</title>
-<style>
+<style nonce="{nonce}">
 body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #222; }}
 h1 {{ font-size: 1.5rem; }} h2 {{ font-size: 1.2rem; margin-top: 2rem; }}
 form {{ margin: 0.5rem 0; }}
@@ -69,13 +85,16 @@ header {{ display: flex; justify-content: space-between; align-items: center; }}
 <body>
 <h1>{title}</h1>
 {body}
+{script}
 </body>
 </html>"#,
         title = esc(title),
-    ))
+    ));
+    let csp = HeaderValue::from_str(&csp).expect("CSP is a valid header value");
+    ([(header::CONTENT_SECURITY_POLICY, csp)], html).into_response()
 }
 
-fn login_form(error: Option<&str>) -> Html<String> {
+fn login_form(error: Option<&str>) -> Response {
     let error = error
         .map(|e| format!(r#"<p class="error">{}</p>"#, esc(e)))
         .unwrap_or_default();
@@ -89,6 +108,21 @@ fn login_form(error: Option<&str>) -> Html<String> {
 </form>"#
         ),
     )
+}
+
+pub fn login_error_status(err: &LoginError) -> (StatusCode, &'static str) {
+    match err {
+        LoginError::Invalid => (StatusCode::FORBIDDEN, "Wrong username or password."),
+        LoginError::Throttled => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed login attempts. Try again later.",
+        ),
+    }
+}
+
+fn login_error_page(err: LoginError) -> Response {
+    let (status, message) = login_error_status(&err);
+    (status, login_form(Some(message))).into_response()
 }
 
 async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -107,15 +141,21 @@ struct LoginForm {
 async fn login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: Extensions,
     Form(form): Form<LoginForm>,
 ) -> Result<Response, ApiError> {
-    let Some(user) = check_credentials(&state, &form.username, &form.password).await else {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        return Ok((
-            StatusCode::FORBIDDEN,
-            login_form(Some("Wrong username or password.")),
-        )
-            .into_response());
+    let ip = client_ip(&state, &headers, peer_addr(&extensions));
+    let user = match authenticate(
+        &state,
+        ip,
+        &form.username,
+        &form.password,
+        Credentials::AccountPasswordOnly,
+    )
+    .await
+    {
+        Ok(user) => user,
+        Err(err) => return Ok(login_error_page(err)),
     };
     let token = random_token(64);
     state.db.with(|conn| {
@@ -285,43 +325,11 @@ async fn render_settings(
 <label>Current password <input name="current" type="password" autocomplete="current-password" required></label>
 <label>New password <input name="new" type="password" autocomplete="new-password" required minlength="8"></label>
 <button type="submit">Change password</button>
-</form>
-
-<script>
-const api = "/index.php/apps/gpoddersync/";
-for (const row of document.querySelectorAll("tr[data-url]")) {{
-  const url = row.dataset.url;
-  row.querySelector(".unsubscribe").addEventListener("click", async (ev) => {{
-    if (!confirm("Unsubscribe from " + url + "?")) return;
-    ev.target.disabled = true;
-    const res = await fetch(api + "subscription_change/create", {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ add: [], remove: [url] }}),
-    }});
-    if (res.ok) row.remove(); else ev.target.disabled = false;
-  }});
-  if (row.querySelector(".cover img")) continue;
-  fetch(api + "personal_settings/podcast_data?url=" + encodeURIComponent(url))
-    .then((res) => res.ok ? res.json() : null)
-    .then((json) => {{
-      const data = json && json.data;
-      if (!data) return;
-      if (data.title) row.querySelector(".title").textContent = data.title;
-      if (data.imageBlob) {{
-        const img = document.createElement("img");
-        img.alt = "";
-        img.src = data.imageBlob;
-        row.querySelector(".cover").replaceChildren(img);
-      }}
-    }})
-    .catch(() => {{}});
-}}
-</script>"#,
+</form>"#,
         username = esc(&user.username),
         base = esc(&state.base_url(headers)),
     );
-    Ok(layout("Podcast sync", &body).into_response())
+    Ok(page("Podcast sync", &body, Some(SETTINGS_SCRIPT)))
 }
 
 #[derive(Deserialize)]
@@ -378,19 +386,28 @@ struct ChangePasswordForm {
 async fn change_password(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: Extensions,
     Form(form): Form<ChangePasswordForm>,
 ) -> Result<Response, ApiError> {
     let Some(user) = session_user(&state, &headers) else {
         return Ok(Redirect::to("/login").into_response());
     };
+    let ip = client_ip(&state, &headers, peer_addr(&extensions));
     let notice = if form.new.chars().count() < 8 {
         "The new password must be at least 8 characters long."
-    } else if check_credentials(&state, &user.username, &form.current)
-        .await
-        .is_none()
+    } else if let Err(err) = authenticate(
+        &state,
+        ip,
+        &user.username,
+        &form.current,
+        Credentials::AccountPasswordOnly,
+    )
+    .await
     {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        "The current password is wrong."
+        match err {
+            LoginError::Invalid => "The current password is wrong.",
+            LoginError::Throttled => "Too many failed attempts. Try again later.",
+        }
     } else {
         let new = form.new.clone();
         let username = user.username.clone();
@@ -398,13 +415,54 @@ async fn change_password(
         let hash = tokio::task::spawn_blocking(move || crate::auth::hash_password(&new))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
-        state.db.with(|conn| {
-            conn.execute(
+        let current_session = cookie(&headers, SESSION_COOKIE).map(sha256_hex);
+        state.db.with(|conn| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute(
                 "UPDATE users SET password_hash = ?1 WHERE username = ?2",
                 rusqlite::params![hash, username],
-            )
+            )?;
+            // Log out every other browser session; app passwords stay valid, as in Nextcloud.
+            tx.execute(
+                "DELETE FROM sessions WHERE user_id = ?1 AND token_hash IS NOT ?2",
+                rusqlite::params![user.id, current_session],
+            )?;
+            tx.commit()
         })?;
-        "Password changed."
+        "Password changed. Other browser sessions have been logged out."
     };
     render_settings(&state, &headers, Some(notice.to_owned())).await
 }
+
+/// Unsubscribe buttons and lazy loading of podcast titles and covers.
+const SETTINGS_SCRIPT: &str = r#"
+const api = "/index.php/apps/gpoddersync/";
+for (const row of document.querySelectorAll("tr[data-url]")) {
+  const url = row.dataset.url;
+  row.querySelector(".unsubscribe").addEventListener("click", async (ev) => {
+    if (!confirm("Unsubscribe from " + url + "?")) return;
+    ev.target.disabled = true;
+    const res = await fetch(api + "subscription_change/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add: [], remove: [url] }),
+    });
+    if (res.ok) row.remove(); else ev.target.disabled = false;
+  });
+  if (row.querySelector(".cover img")) continue;
+  fetch(api + "personal_settings/podcast_data?url=" + encodeURIComponent(url))
+    .then((res) => res.ok ? res.json() : null)
+    .then((json) => {
+      const data = json && json.data;
+      if (!data) return;
+      if (data.title) row.querySelector(".title").textContent = data.title;
+      if (data.imageBlob) {
+        const img = document.createElement("img");
+        img.alt = "";
+        img.src = data.imageBlob;
+        row.querySelector(".cover").replaceChildren(img);
+      }
+    })
+    .catch(() => {});
+}
+"#;

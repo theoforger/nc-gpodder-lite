@@ -20,12 +20,24 @@ pub fn create_user(conn: &Connection, username: &str, password: &str) -> rusqlit
     Ok(())
 }
 
-/// Returns false if the user does not exist.
-pub fn set_password(conn: &Connection, username: &str, password: &str) -> rusqlite::Result<bool> {
-    Ok(conn.execute(
+/// Returns false if the user does not exist. Logs out all of the user's browser
+/// sessions; app passwords stay valid, as in Nextcloud.
+pub fn set_password(
+    conn: &mut Connection,
+    username: &str,
+    password: &str,
+) -> rusqlite::Result<bool> {
+    let tx = conn.transaction()?;
+    let updated = tx.execute(
         "UPDATE users SET password_hash = ?1 WHERE username = ?2",
         params![hash_password(password), username],
-    )? > 0)
+    )? > 0;
+    tx.execute(
+        "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?1)",
+        [username],
+    )?;
+    tx.commit()?;
+    Ok(updated)
 }
 
 /// Deletes the user, their app passwords and sessions, and all their sync data.

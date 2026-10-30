@@ -45,7 +45,8 @@ credentials with HTTP Basic auth.
 | `--db` | `NCGL_DB` | `nc-gpodder-lite.db` | SQLite database path |
 | `--listen` | `NCGL_LISTEN` | `0.0.0.0:8080` | Listen address |
 | `--public-url` | `NCGL_PUBLIC_URL` | derived from `Host` / `X-Forwarded-Proto` / `X-Forwarded-Host` | Base URL returned to clients by Login Flow v2 |
-| `--allow-local-remote-servers` | `NCGL_ALLOW_LOCAL_REMOTE_SERVERS` | off | Allow fetching feeds from loopback/private IPs (like Nextcloud's `allow_local_remote_servers`) |
+| `--allow-local-remote-servers` | `NCGL_ALLOW_LOCAL_REMOTE_SERVERS` | off | Allow fetching feeds from loopback/private IPs (like Nextcloud's `allow_local_remote_servers`). Without it, `HTTP(S)_PROXY` is also ignored for feed fetches |
+| `--trusted-proxies` | `NCGL_TRUSTED_PROXIES` | none | Comma-separated IPs/CIDR ranges of reverse proxies whose `X-Forwarded-For` gives the real client IP, e.g. `172.16.0.0/12` |
 
 Log verbosity is controlled with `RUST_LOG` (e.g. `RUST_LOG=debug`).
 
@@ -92,5 +93,28 @@ Deliberate differences from upstream:
   episode-action upsert can't find the row it conflicts with, that entry is skipped.
 - An episode-action upload is validated in full before anything is saved, so a bad entry
   doesn't leave a partially saved batch.
-- `podcast_data` checks that the user knows the podcast before returning cached data.
+- `podcast_data` checks that the user knows the podcast before returning cached data, and
+  returns a generic error message when a feed can't be fetched.
 - Results are returned in insertion order.
+
+## Security
+
+- **Passwords:** account passwords are stored as Argon2id hashes. App passwords and session
+  tokens are random and stored as SHA-256 hashes.
+- **What app passwords can do:** they only work for the sync API (HTTP Basic auth). Logging
+  in to the web UI, granting a login flow, and changing the password all require the
+  account password.
+- **Brute-force protection:** after 10 failed password attempts for a username, or 30 from
+  one client IP, within 15 minutes, further password attempts get HTTP 429 until the window
+  passes. App passwords keep working, so an attack on a username can't lock out that user's
+  devices. Behind a reverse proxy, set `--trusted-proxies` so the real client IP is used;
+  otherwise every client appears to come from the proxy's address.
+- **CSRF protection:** browser requests that change state must come from the server's own
+  origin (checked via `Origin`/`Referer`). Set `--public-url` so the check knows the exact
+  origin.
+- **Login Flow v2:** granting access always asks for the account password, and the page
+  warns against granting access via links sent by someone else.
+- **Browser hardening:** pages are sent with a strict Content-Security-Policy and can't be
+  framed.
+- **Feed fetching:** like Nextcloud, feeds and images aren't fetched from loopback or private
+  addresses. Fetched podcast data is cached for 24 hours, with the cache capped at 128 MB.
