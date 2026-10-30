@@ -51,7 +51,19 @@ credentials with HTTP Basic auth.
 | `--allow-local-remote-servers` | `NCGL_ALLOW_LOCAL_REMOTE_SERVERS` | off | Allow fetching feeds from loopback/private IPs (like Nextcloud's `allow_local_remote_servers`). Without it, `HTTP(S)_PROXY` is also ignored for feed fetches |
 | `--trusted-proxies` | `NCGL_TRUSTED_PROXIES` | none | Comma-separated IPs/CIDR ranges of reverse proxies whose `X-Forwarded-For` gives the real client IP, e.g. `172.16.0.0/12` |
 
-Log verbosity is controlled with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+Logs go to stdout (`docker compose logs -f` with Compose); verbosity is controlled with
+`RUST_LOG`. At the default `info` level, every sync request logs one line with the user and
+counts, plus a line when an app connects through the login flow:
+
+```
+INFO …subscription: subscriptions uploaded user=alice added=3 removed=1 invalid=1
+INFO …episode_action: episode actions uploaded user=alice received=2 inserted=1 updated=1 skipped=0
+INFO …episode_action: episode actions downloaded user=alice since=1793394420 all_actions=false count=1
+INFO …login_flow: app connected via login flow user=alice client="AntennaPod/3.6.0"
+```
+
+Podcast and episode URLs are only logged at `debug` level
+(`RUST_LOG=nc_gpodder_lite=debug`), since together they reveal a user's listening history.
 
 User management: `nc-gpodder-lite user add|passwd|delete|list`. When stdin is piped,
 the password is read from its first line.

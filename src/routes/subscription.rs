@@ -27,6 +27,13 @@ pub async fn list(
             urls_with_state(conn, &user.username, false, since)?,
         ))
     })?;
+    tracing::info!(
+        user = %user.username,
+        since,
+        added = add.len(),
+        removed = remove.len(),
+        "subscriptions downloaded"
+    );
     Ok(PhpJson::ok(json!({
         "add": add,
         "remove": remove,
@@ -57,15 +64,26 @@ pub async fn create(
     // `create(array $add, array $remove)`: both parameters are required arrays of
     // strings; a missing or mistyped value is a TypeError (HTTP 500) upstream.
     let params: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let add = url_list(&params, "add")?;
-    let remove = url_list(&params, "remove")?;
+    let (add, remove) = url_list(&params, "add")
+        .and_then(|add| Ok((add, url_list(&params, "remove")?)))
+        .inspect_err(|err| {
+            tracing::warn!(user = %user.username, error = %err.1, "subscription upload rejected");
+        })?;
 
-    state.db.with(|conn| -> rusqlite::Result<()> {
+    let saved = state.db.with(|conn| -> rusqlite::Result<usize> {
         let tx = conn.transaction()?;
-        save_changes(&tx, &user.username, &add, &remove)?;
-        tx.commit()
+        let saved = save_changes(&tx, &user.username, &add, &remove)?;
+        tx.commit()?;
+        Ok(saved)
     })?;
 
+    tracing::info!(
+        user = %user.username,
+        added = add.len(),
+        removed = remove.len(),
+        invalid = add.len() + remove.len() - saved,
+        "subscriptions uploaded"
+    );
     Ok(PhpJson::ok(json!({ "timestamp": now() })))
 }
 
@@ -91,20 +109,22 @@ fn url_list(params: &Value, name: &str) -> Result<Vec<String>, ApiError> {
 }
 
 /// Writes adds first, then removes, so a URL in both lists ends up unsubscribed.
-/// Invalid URLs are silently dropped.
+/// Invalid URLs are silently dropped. Returns the number of changes saved.
 pub fn save_changes(
     conn: &Connection,
     user_id: &str,
     add: &[String],
     remove: &[String],
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<usize> {
     let updated = now();
     let changes = add
         .iter()
         .map(|u| (u, true))
         .chain(remove.iter().map(|u| (u, false)));
+    let mut saved = 0;
     for (url, subscribed) in changes {
         if !is_valid_url(url) {
+            tracing::debug!(user = user_id, url, "ignored invalid subscription URL");
             continue;
         }
         conn.prepare_cached(
@@ -114,8 +134,10 @@ pub fn save_changes(
              DO UPDATE SET subscribed = excluded.subscribed, updated = excluded.updated",
         )?
         .execute(params![url, subscribed, updated, user_id])?;
+        tracing::debug!(user = user_id, url, subscribed, "subscription saved");
+        saved += 1;
     }
-    Ok(())
+    Ok(saved)
 }
 
 /// Approximates PHP's `filter_var($url, FILTER_VALIDATE_URL)`.

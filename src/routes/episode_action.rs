@@ -51,6 +51,13 @@ pub async fn list(
         .collect()
     })?;
 
+    tracing::info!(
+        user = %user.username,
+        since,
+        all_actions,
+        count = actions.len(),
+        "episode actions downloaded"
+    );
     Ok(php_json(
         StatusCode::OK,
         &ListResponse {
@@ -99,16 +106,32 @@ pub async fn create(
     let actions = entries
         .iter()
         .map(EpisodeAction::from_value)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .inspect_err(|err| {
+            tracing::warn!(user = %user.username, error = %err.1, "episode action upload rejected");
+        })?;
 
+    let (mut inserted, mut updated, mut skipped) = (0, 0, 0);
     state.db.with(|conn| -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
         for action in &actions {
-            save(&tx, &user.username, action)?;
+            match save(&tx, &user.username, action)? {
+                Saved::Inserted => inserted += 1,
+                Saved::Updated => updated += 1,
+                Saved::Skipped => skipped += 1,
+            }
         }
         tx.commit()
     })?;
 
+    tracing::info!(
+        user = %user.username,
+        received = actions.len(),
+        inserted,
+        updated,
+        skipped,
+        "episode actions uploaded"
+    );
     Ok(PhpJson::ok(json!({ "timestamp": now() })))
 }
 
@@ -175,8 +198,17 @@ fn optional_int(obj: &Map<String, Value>, key: &str) -> Result<i64, ApiError> {
     }
 }
 
+/// What happened to one uploaded action.
+#[derive(Debug)]
+enum Saved {
+    Inserted,
+    Updated,
+    /// Dropped after a database error, like upstream does.
+    Skipped,
+}
+
 /// Insert-or-update, following upstream `EpisodeActionSaver::saveEpisodeActions`.
-fn save(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result<()> {
+fn save(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result<Saved> {
     let inserted = conn
         .prepare_cached(
             "INSERT INTO gpodder_episode_action
@@ -194,18 +226,26 @@ fn save(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result
             a.guid,
             user_id
         ]);
-    match inserted {
-        Ok(_) => Ok(()),
-        Err(err) if is_unique_violation(&err) => update_existing(conn, user_id, a),
+    let saved = match inserted {
+        Ok(_) => Saved::Inserted,
+        Err(err) if is_unique_violation(&err) => update_existing(conn, user_id, a)?,
         // Upstream swallows any other database error for an individual action.
         Err(err) => {
             tracing::warn!("failed to save episode action {:?}: {err}", a.episode);
-            Ok(())
+            Saved::Skipped
         }
-    }
+    };
+    tracing::debug!(
+        user = user_id,
+        episode = a.episode,
+        action = a.action,
+        outcome = ?saved,
+        "episode action saved"
+    );
+    Ok(saved)
 }
 
-fn update_existing(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result<()> {
+fn update_existing(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result<Saved> {
     let by_guid = match &a.guid {
         Some(guid) => find_by(conn, "guid", guid, user_id, &a.action)?,
         None => None,
@@ -217,7 +257,7 @@ fn update_existing(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusql
     // Upstream dereferences null here and fails the whole request; skip instead.
     let Some((id, existing_guid)) = existing else {
         tracing::warn!("no conflicting episode action found for {:?}", a.episode);
-        return Ok(());
+        return Ok(Saved::Skipped);
     };
     // An incoming null guid never replaces a stored one.
     let guid = a.guid.clone().or(existing_guid);
@@ -235,10 +275,11 @@ fn update_existing(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusql
             }
             if let Err(err) = update_row(conn, id, user_id, a, &guid) {
                 tracing::warn!("failed to update episode action {:?}: {err}", a.episode);
+                return Ok(Saved::Skipped);
             }
-            Ok(())
+            Ok(Saved::Updated)
         }
-        other => other.map(|_| ()),
+        other => other.map(|_| Saved::Updated),
     }
 }
 

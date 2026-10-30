@@ -237,6 +237,7 @@ pub async fn grant(
     if !granted {
         return Ok(invalid_flow_page());
     }
+    tracing::info!(user = %user.username, client, "app connected via login flow");
 
     Ok(layout(
         "Account connected",
