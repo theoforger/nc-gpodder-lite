@@ -6,59 +6,77 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{bool_param, int_param, is_numeric};
 use crate::AppState;
 use crate::auth::AuthUser;
 use crate::db::{is_unique_violation, now};
-use crate::json::{ApiError, PhpJson};
+use crate::json::{ApiError, PhpJson, php_json};
 use crate::time::{format_timestamp, parse_timestamp};
 
 pub async fn list(
     user: AuthUser,
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
-) -> Result<PhpJson, ApiError> {
+) -> Result<Response, ApiError> {
     let since = int_param(&query, "since", 0)?;
     let all_actions = bool_param(&query, "allActions");
 
-    let actions = state.db.with(|conn| -> rusqlite::Result<Vec<Value>> {
-        let mut stmt = conn.prepare(
+    let actions = state.db.with(|conn| -> rusqlite::Result<Vec<ActionRow>> {
+        // Actions are stored uppercased, so `action = 'PLAY'` matches upstream's
+        // case-insensitive "play" filter.
+        let mut stmt = conn.prepare_cached(
             "SELECT podcast, episode, timestamp_epoch, guid, position, started, total, action
              FROM gpodder_episode_action
-             WHERE timestamp_epoch > ?1 AND user_id = ?2
+             WHERE user_id = ?1 AND timestamp_epoch > ?2 AND (?3 OR action = 'PLAY')
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![since, user.username], |r| {
-            Ok((
-                json!({
-                    "podcast": r.get::<_, String>(0)?,
-                    "episode": r.get::<_, String>(1)?,
-                    "timestamp": format_timestamp(r.get(2)?),
-                    "guid": r.get::<_, Option<String>>(3)?,
-                    "position": r.get::<_, i64>(4)?,
-                    "started": r.get::<_, i64>(5)?,
-                    "total": r.get::<_, i64>(6)?,
-                    "action": r.get::<_, String>(7)?,
-                }),
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        let mut actions = Vec::new();
-        for row in rows {
-            let (action, name) = row?;
-            if all_actions || name.eq_ignore_ascii_case("play") {
-                actions.push(action);
-            }
-        }
-        Ok(actions)
+        stmt.query_map(params![user.username, since, all_actions], |r| {
+            Ok(ActionRow {
+                podcast: r.get(0)?,
+                episode: r.get(1)?,
+                timestamp: format_timestamp(r.get(2)?),
+                guid: r.get(3)?,
+                position: r.get(4)?,
+                started: r.get(5)?,
+                total: r.get(6)?,
+                action: r.get(7)?,
+            })
+        })?
+        .collect()
     })?;
 
-    Ok(PhpJson::ok(
-        json!({ "actions": actions, "timestamp": now() }),
+    Ok(php_json(
+        StatusCode::OK,
+        &ListResponse {
+            actions,
+            timestamp: now(),
+        },
     ))
+}
+
+/// One action as returned by `EpisodeAction::toArray()`; field order matters.
+#[derive(Serialize)]
+struct ActionRow {
+    podcast: String,
+    episode: String,
+    timestamp: String,
+    guid: Option<String>,
+    position: i64,
+    started: i64,
+    total: i64,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct ListResponse {
+    actions: Vec<ActionRow>,
+    timestamp: i64,
 }
 
 pub async fn create(
@@ -94,7 +112,6 @@ pub async fn create(
     Ok(PhpJson::ok(json!({ "timestamp": now() })))
 }
 
-#[derive(Debug)]
 struct EpisodeAction {
     podcast: String,
     episode: String,
@@ -160,11 +177,13 @@ fn optional_int(obj: &Map<String, Value>, key: &str) -> Result<i64, ApiError> {
 
 /// Insert-or-update, following upstream `EpisodeActionSaver::saveEpisodeActions`.
 fn save(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result<()> {
-    let inserted = conn.execute(
-        "INSERT INTO gpodder_episode_action
-            (podcast, episode, action, position, started, total, timestamp_epoch, guid, user_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+    let inserted = conn
+        .prepare_cached(
+            "INSERT INTO gpodder_episode_action
+                (podcast, episode, action, position, started, total, timestamp_epoch, guid, user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?
+        .execute(params![
             a.podcast,
             a.episode,
             a.action,
@@ -174,8 +193,7 @@ fn save(conn: &Connection, user_id: &str, a: &EpisodeAction) -> rusqlite::Result
             a.timestamp_epoch,
             a.guid,
             user_id
-        ],
-    );
+        ]);
     match inserted {
         Ok(_) => Ok(()),
         Err(err) if is_unique_violation(&err) => update_existing(conn, user_id, a),
@@ -231,14 +249,13 @@ fn find_by(
     user_id: &str,
     action: &str,
 ) -> rusqlite::Result<Option<(i64, Option<String>)>> {
-    conn.query_row(
-        &format!(
-            "SELECT id, guid FROM gpodder_episode_action
-             WHERE {column} = ?1 AND user_id = ?2 AND action = ?3"
-        ),
-        params![value, user_id, action],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
+    conn.prepare_cached(&format!(
+        "SELECT id, guid FROM gpodder_episode_action
+         WHERE {column} = ?1 AND user_id = ?2 AND action = ?3"
+    ))?
+    .query_row(params![value, user_id, action], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
     .optional()
 }
 
@@ -249,22 +266,22 @@ fn update_row(
     a: &EpisodeAction,
     guid: &Option<String>,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE gpodder_episode_action
          SET podcast = ?1, episode = ?2, action = ?3, position = ?4, started = ?5, total = ?6,
              timestamp_epoch = ?7, guid = ?8, user_id = ?9
          WHERE id = ?10",
-        params![
-            a.podcast,
-            a.episode,
-            a.action,
-            a.position,
-            a.started,
-            a.total,
-            a.timestamp_epoch,
-            guid,
-            user_id,
-            id
-        ],
-    )
+    )?
+    .execute(params![
+        a.podcast,
+        a.episode,
+        a.action,
+        a.position,
+        a.started,
+        a.total,
+        a.timestamp_epoch,
+        guid,
+        user_id,
+        id
+    ])
 }

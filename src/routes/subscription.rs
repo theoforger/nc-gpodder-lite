@@ -40,7 +40,7 @@ pub fn urls_with_state(
     subscribed: bool,
     since: i64,
 ) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT url FROM gpodder_subscriptions
          WHERE subscribed = ?1 AND updated > ?2 AND user_id = ?3
          ORDER BY id",
@@ -107,13 +107,13 @@ pub fn save_changes(
         if !is_valid_url(url) {
             continue;
         }
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO gpodder_subscriptions (url, subscribed, updated, user_id)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (url, user_id)
              DO UPDATE SET subscribed = excluded.subscribed, updated = excluded.updated",
-            params![url, subscribed, updated, user_id],
-        )?;
+        )?
+        .execute(params![url, subscribed, updated, user_id])?;
     }
     Ok(())
 }

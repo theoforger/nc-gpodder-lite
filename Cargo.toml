@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 argon2 = "0.6.0"
-axum = { version = "0.8", features = ["macros"] }
+axum = "0.8"
 base64 = "0.23.1"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive", "env"] }
@@ -19,14 +19,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["full"] }
-tower-http = { version = "0.7.1", features = ["trace"] }
+tower-http = { version = "0.7.1", features = ["compression-gzip", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
 http-body-util = "0.1.5"
-tempfile = "3.27.0"
 tower = "0.5.3"
 
 # The nextcloud-gpodder revision this server is feature-compatible with.
@@ -35,3 +34,8 @@ tower = "0.5.3"
 repository = "https://github.com/thrillfall/nextcloud-gpodder"
 version = "3.18.0"
 commit = "1f190b3438ec68224eef2635e7d675e564eb8617"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -4,8 +4,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -15,12 +16,12 @@ use serde::Deserialize;
 use super::personal_settings::podcast_metrics;
 use crate::AppState;
 use crate::auth::{
-    Credentials, LoginError, SESSION_COOKIE, authenticate, cookie, random_token, session_user,
-    sha256_hex,
+    AuthUser, Credentials, LoginError, SESSION_COOKIE, SESSION_LIFETIME_SECS, authenticate, cookie,
+    random_token, session_user, sha256_hex,
 };
 use crate::db::now;
 use crate::json::ApiError;
-use crate::security::{client_ip, peer_addr};
+use crate::security::ClientIp;
 use crate::users;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -35,6 +36,23 @@ pub fn router() -> Router<Arc<AppState>> {
             post(delete_app_password),
         )
         .route("/settings/password", post(change_password))
+}
+
+/// The user logged in to the web UI; requests without a session are redirected
+/// to the login page.
+struct WebUser(AuthUser);
+
+impl FromRequestParts<Arc<AppState>> for WebUser {
+    type Rejection = Redirect;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        session_user(state, &parts.headers)
+            .map(WebUser)
+            .ok_or_else(|| Redirect::to("/login"))
+    }
 }
 
 pub fn esc(s: &str) -> String {
@@ -120,8 +138,8 @@ pub fn login_error_status(err: &LoginError) -> (StatusCode, &'static str) {
     }
 }
 
-fn login_error_page(err: LoginError) -> Response {
-    let (status, message) = login_error_status(&err);
+fn login_error_page(err: &LoginError) -> Response {
+    let (status, message) = login_error_status(err);
     (status, login_form(Some(message))).into_response()
 }
 
@@ -141,10 +159,9 @@ struct LoginForm {
 async fn login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    extensions: Extensions,
+    ClientIp(ip): ClientIp,
     Form(form): Form<LoginForm>,
 ) -> Result<Response, ApiError> {
-    let ip = client_ip(&state, &headers, peer_addr(&extensions));
     let user = match authenticate(
         &state,
         ip,
@@ -155,13 +172,13 @@ async fn login(
     .await
     {
         Ok(user) => user,
-        Err(err) => return Ok(login_error_page(err)),
+        Err(err) => return Ok(login_error_page(&err)),
     };
     let token = random_token(64);
     state.db.with(|conn| {
         conn.execute(
             "DELETE FROM sessions WHERE created_at < ?1",
-            [now() - crate::auth::SESSION_LIFETIME_SECS],
+            [now() - SESSION_LIFETIME_SECS],
         )?;
         conn.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at) VALUES (?1, ?2, ?3)",
@@ -175,7 +192,7 @@ async fn login(
     };
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
-        crate::auth::SESSION_LIFETIME_SECS
+        SESSION_LIFETIME_SECS
     );
     let mut res = Redirect::to("/settings").into_response();
     res.headers_mut()
@@ -223,19 +240,18 @@ fn format_duration(seconds: i64) -> String {
 
 async fn settings_page(
     State(state): State<Arc<AppState>>,
+    WebUser(user): WebUser,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    render_settings(&state, &headers, None).await
+    render_settings(&state, &headers, &user, None)
 }
 
-async fn render_settings(
+fn render_settings(
     state: &AppState,
     headers: &HeaderMap,
+    user: &AuthUser,
     notice: Option<String>,
 ) -> Result<Response, ApiError> {
-    let Some(user) = session_user(state, headers) else {
-        return Ok(Redirect::to("/login").into_response());
-    };
     let (metrics, app_passwords) = state.db.with(|conn| -> rusqlite::Result<_> {
         Ok((
             podcast_metrics(conn, &user.username)?,
@@ -339,12 +355,10 @@ struct NewAppPasswordForm {
 
 async fn create_app_password(
     State(state): State<Arc<AppState>>,
+    WebUser(user): WebUser,
     headers: HeaderMap,
     Form(form): Form<NewAppPasswordForm>,
 ) -> Result<Response, ApiError> {
-    let Some(user) = session_user(&state, &headers) else {
-        return Ok(Redirect::to("/login").into_response());
-    };
     let name = form.name.trim();
     let name = if name.is_empty() {
         "App password"
@@ -360,17 +374,14 @@ async fn create_app_password(
         esc(&user.username),
         esc(&token)
     );
-    render_settings(&state, &headers, Some(notice)).await
+    render_settings(&state, &headers, &user, Some(notice))
 }
 
 async fn delete_app_password(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    WebUser(user): WebUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let Some(user) = session_user(&state, &headers) else {
-        return Ok(Redirect::to("/login").into_response());
-    };
     state
         .db
         .with(|conn| users::delete_app_password(conn, user.id, id))?;
@@ -385,14 +396,11 @@ struct ChangePasswordForm {
 
 async fn change_password(
     State(state): State<Arc<AppState>>,
+    WebUser(user): WebUser,
     headers: HeaderMap,
-    extensions: Extensions,
+    ClientIp(ip): ClientIp,
     Form(form): Form<ChangePasswordForm>,
 ) -> Result<Response, ApiError> {
-    let Some(user) = session_user(&state, &headers) else {
-        return Ok(Redirect::to("/login").into_response());
-    };
-    let ip = client_ip(&state, &headers, peer_addr(&extensions));
     let notice = if form.new.chars().count() < 8 {
         "The new password must be at least 8 characters long."
     } else if let Err(err) = authenticate(
@@ -431,7 +439,7 @@ async fn change_password(
         })?;
         "Password changed. Other browser sessions have been logged out."
     };
-    render_settings(&state, &headers, Some(notice.to_owned())).await
+    render_settings(&state, &headers, &user, Some(notice.to_owned()))
 }
 
 /// Unsubscribe buttons and lazy loading of podcast titles and covers.

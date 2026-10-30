@@ -12,7 +12,7 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url, header, redirect};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 const USER_AGENT: &str = "nextcloud-gpodder (+https://nextcloud.com; like iTMS)";
@@ -20,7 +20,7 @@ const FALLBACK_USER_AGENT: &str = "nextcloud-gpodder (+https://nextcloud.com)";
 const MAX_FEED_BYTES: usize = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodcastData {
     pub title: Option<String>,
@@ -75,8 +75,15 @@ impl Cache {
             return;
         }
         self.remove(&url);
-        self.entries.retain(|_, e| e.inserted.elapsed() < CACHE_TTL);
-        self.total_bytes = self.entries.values().map(|e| e.size).sum();
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.inserted.elapsed() >= CACHE_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in expired {
+            self.remove(&key);
+        }
         while self.total_bytes + size > CACHE_MAX_BYTES {
             let Some(oldest) = self
                 .entries
@@ -405,7 +412,7 @@ pub fn parse_rss_xml(xml: &str, fetched_at_unix: i64) -> Result<PodcastData, Box
                             "title" if !seen_title => (title, seen_title) = (value, true),
                             "link" if !seen_link => (link, seen_link) = (value, true),
                             "description" if !seen_description => {
-                                (description, seen_description) = (value, true)
+                                (description, seen_description) = (value, true);
                             }
                             _ => {}
                         }

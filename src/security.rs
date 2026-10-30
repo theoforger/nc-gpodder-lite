@@ -3,12 +3,14 @@
 //! and security response headers.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -88,12 +90,9 @@ impl FromStr for IpNet {
 
 /// The address of the client that made the request. If the direct peer is a
 /// trusted proxy, the right-most untrusted address in `X-Forwarded-For` is used.
-pub fn client_ip(
-    state: &AppState,
-    headers: &HeaderMap,
-    peer: Option<SocketAddr>,
-) -> Option<IpAddr> {
-    let mut ip = canonical(peer?.ip());
+pub fn client_ip(state: &AppState, parts: &Parts) -> Option<IpAddr> {
+    let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>()?.0;
+    let mut ip = canonical(peer.ip());
     let trusted = |ip: IpAddr| {
         state
             .config
@@ -104,7 +103,8 @@ pub fn client_ip(
     if !trusted(ip) {
         return Some(ip);
     }
-    let forwarded: Vec<IpAddr> = headers
+    let forwarded: Vec<IpAddr> = parts
+        .headers
         .get_all("x-forwarded-for")
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -120,8 +120,18 @@ pub fn client_ip(
     Some(ip)
 }
 
-pub fn peer_addr(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
-    extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)
+/// Extractor for [`client_ip`]. `None` when the peer address is unknown (in tests).
+pub struct ClientIp(pub Option<IpAddr>);
+
+impl FromRequestParts<Arc<AppState>> for ClientIp {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(client_ip(state, parts)))
+    }
 }
 
 /// Failed password attempts allowed per window before further attempts are refused.
@@ -146,18 +156,30 @@ impl LoginThrottle {
         ]
     }
 
+    /// Whether password attempts for this username or IP are currently refused.
+    pub fn is_blocked(&self, username: &str, ip: Option<IpAddr>) -> bool {
+        let failures = self.failures.lock().unwrap();
+        Self::over_limit(&failures, &Self::keys(username, ip))
+    }
+
+    fn over_limit(
+        failures: &HashMap<String, (u32, Instant)>,
+        keys: &[(Option<String>, u32)],
+    ) -> bool {
+        keys.iter().any(|(key, max)| {
+            key.as_ref()
+                .and_then(|k| failures.get(k))
+                .is_some_and(|(count, since)| *count >= *max && since.elapsed() < FAILURE_WINDOW)
+        })
+    }
+
     /// Atomically checks the limits and counts a new password attempt. Counting
     /// before the (slow) password check means concurrent attempts can't all slip
     /// past the limit. Returns false if the attempt must be refused.
     pub fn begin_attempt(&self, username: &str, ip: Option<IpAddr>) -> bool {
         let mut failures = self.failures.lock().unwrap();
         let keys = Self::keys(username, ip);
-        let blocked = keys.iter().any(|(key, max)| {
-            key.as_ref()
-                .and_then(|k| failures.get(k))
-                .is_some_and(|(count, since)| *count >= *max && since.elapsed() < FAILURE_WINDOW)
-        });
-        if blocked {
+        if Self::over_limit(&failures, &keys) {
             return false;
         }
         if failures.len() >= MAX_TRACKED_KEYS {
@@ -285,7 +307,7 @@ fn redact(uri: &Uri) -> String {
 }
 
 /// Adds headers that keep browsers from sniffing, framing, or leaking URLs.
-/// HTML pages set their own `Content-Security-Policy` (see `routes::web::layout`).
+/// HTML pages set their own `Content-Security-Policy` (see `routes::web::page`).
 ///
 /// The referrer policy is `same-origin`, not `no-referrer`: under `no-referrer`
 /// browsers send `Origin: null` even on same-origin form posts, which

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::HeaderMap;
 
+use crate::auth::VerifiedPasswords;
 use crate::db::Db;
 use crate::podcast_data::PodcastDataReader;
 use crate::security::{IpNet, LoginThrottle};
@@ -33,6 +34,7 @@ pub struct AppState {
     pub config: Config,
     pub podcast_data: PodcastDataReader,
     pub login_throttle: LoginThrottle,
+    pub verified_passwords: VerifiedPasswords,
 }
 
 impl AppState {
@@ -46,6 +48,7 @@ impl AppState {
             config,
             podcast_data,
             login_throttle: LoginThrottle::default(),
+            verified_passwords: VerifiedPasswords::default(),
         }
     }
 

@@ -15,6 +15,7 @@ const ORIGIN: &str = "https://pods.example.com";
 
 struct TestServer {
     app: Router,
+    state: Arc<AppState>,
     auth: String,
 }
 
@@ -39,8 +40,10 @@ fn server() -> TestServer {
             trusted_proxies: Vec::new(),
         },
     );
+    let state = Arc::new(state);
     TestServer {
-        app: app(Arc::new(state)),
+        app: app(state.clone()),
+        state,
         auth: basic("alice", "secret-pw"),
     }
 }
@@ -944,4 +947,45 @@ async fn podcast_data_fetch_errors_are_generic() {
         .await;
     assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(res.text, r#"{"message":"Failed to fetch podcast data"}"#);
+}
+
+#[tokio::test]
+async fn remembered_passwords_stop_working_after_a_password_change() {
+    let s = server();
+    let path = format!("{API}/subscriptions");
+    // The first request verifies the password with Argon2; the second is served
+    // from the verified-password cache.
+    assert_eq!(s.get(&path).await.status, StatusCode::OK);
+    assert_eq!(s.get(&path).await.status, StatusCode::OK);
+
+    // Change the password directly in the database, as `user passwd` does from
+    // another process while the server is running.
+    s.state
+        .db
+        .with(|conn| users::set_password(conn, "alice", "changed-pw-1"))
+        .unwrap();
+    assert_eq!(s.get(&path).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        s.get_as(&basic("alice", "changed-pw-1"), &path)
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn gzip_is_used_only_when_requested() {
+    let s = server();
+    let request = |encoding: Option<&str>| {
+        let mut req = Request::get(format!("{API}/episode_action?since=0"))
+            .header(header::AUTHORIZATION, basic("alice", "secret-pw"));
+        if let Some(encoding) = encoding {
+            req = req.header(header::ACCEPT_ENCODING, encoding);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    let plain = s.app.clone().oneshot(request(None)).await.unwrap();
+    assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+    let gzipped = s.app.clone().oneshot(request(Some("gzip"))).await.unwrap();
+    assert_eq!(gzipped.headers()[header::CONTENT_ENCODING], "gzip");
 }

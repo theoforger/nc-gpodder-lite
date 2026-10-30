@@ -65,13 +65,19 @@ impl PhpJson {
 
 impl IntoResponse for PhpJson {
     fn into_response(self) -> Response {
-        (
-            self.0,
-            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-            to_php_json(&self.1),
-        )
-            .into_response()
+        php_json(self.0, &self.1)
     }
+}
+
+/// Renders any serializable value as a Nextcloud-style JSON response. Serializing
+/// typed rows directly avoids building an intermediate `serde_json::Value`.
+pub fn php_json<T: Serialize + ?Sized>(status: StatusCode, value: &T) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        to_php_json(value),
+    )
+        .into_response()
 }
 
 /// Error responses for the cases where upstream fails with an uncaught exception

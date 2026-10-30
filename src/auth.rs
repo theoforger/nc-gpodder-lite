@@ -2,9 +2,10 @@
 //! the account password or an app password (as issued by Login Flow v2), plus a
 //! session cookie for the web UI.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
@@ -21,10 +22,73 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::db::now;
 use crate::json::PhpJson;
-use crate::security::{TooManyAttempts, client_ip, peer_addr};
+use crate::security::{TooManyAttempts, client_ip};
 
 pub const SESSION_COOKIE: &str = "ncgl_session";
 pub const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+const LAST_USED_RESOLUTION_SECS: i64 = 60;
+
+/// How long a verified account password is remembered.
+const VERIFIED_PASSWORD_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_VERIFIED_PASSWORDS: usize = 10_000;
+
+/// Remembers recently verified account passwords so clients that sync with the
+/// account password (rather than an app password) don't pay for an Argon2 hash on
+/// every request.
+///
+/// Entries are keyed by a keyed SHA-256 over the user id, the stored password hash
+/// and the password, using a random per-process key. The password itself is never
+/// kept, and any password change alters the stored hash, which invalidates entries
+/// automatically, including changes made by the CLI while the server is running.
+pub struct VerifiedPasswords {
+    key: [u8; 32],
+    entries: Mutex<HashMap<[u8; 32], Instant>>,
+}
+
+impl Default for VerifiedPasswords {
+    fn default() -> Self {
+        VerifiedPasswords {
+            key: rand::random(),
+            entries: Mutex::default(),
+        }
+    }
+}
+
+impl VerifiedPasswords {
+    fn fingerprint(&self, user_id: i64, password_hash: &str, password: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.key);
+        hasher.update(user_id.to_le_bytes());
+        for part in [password_hash, password] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    fn contains(&self, fingerprint: &[u8; 32]) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        match entries.get(fingerprint) {
+            Some(verified) if verified.elapsed() < VERIFIED_PASSWORD_TTL => true,
+            Some(_) => {
+                entries.remove(fingerprint);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&self, fingerprint: [u8; 32]) {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() >= MAX_VERIFIED_PASSWORDS {
+            entries.retain(|_, verified| verified.elapsed() < VERIFIED_PASSWORD_TTL);
+            if entries.len() >= MAX_VERIFIED_PASSWORDS {
+                entries.clear();
+            }
+        }
+        entries.insert(fingerprint, Instant::now());
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AuthUser {
@@ -104,11 +168,25 @@ pub async fn authenticate(
         else {
             return Ok(None);
         };
-        let app_password_used = accepted == Credentials::AnyPassword
-            && conn.execute(
-                "UPDATE app_passwords SET last_used = ?1 WHERE user_id = ?2 AND token_hash = ?3",
-                params![now(), id, token_hash],
-            )? > 0;
+        let mut app_password_used = false;
+        if accepted == Credentials::AnyPassword
+            && let Some((token_id, last_used)) = conn
+                .prepare_cached(
+                    "SELECT id, last_used FROM app_passwords WHERE user_id = ?1 AND token_hash = ?2",
+                )?
+                .query_row(params![id, token_hash], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+                })
+                .optional()?
+        {
+            app_password_used = true;
+            // Like Nextcloud, refresh "last used" at most once a minute instead of
+            // writing to the database on every sync request.
+            if last_used.is_none_or(|t| now() - t >= LAST_USED_RESOLUTION_SECS) {
+                conn.prepare_cached("UPDATE app_passwords SET last_used = ?1 WHERE id = ?2")?
+                    .execute(params![now(), token_id])?;
+            }
+        }
         Ok(Some((id, password_hash, app_password_used)))
     });
     let found = lookup.unwrap_or_else(|err| {
@@ -118,6 +196,21 @@ pub async fn authenticate(
     if let Some((id, _, true)) = found {
         return Ok(AuthUser {
             id,
+            username: username.to_owned(),
+        });
+    }
+
+    // A recently verified account password skips Argon2, unless logins for this
+    // user or IP are currently throttled.
+    let fingerprint = found
+        .as_ref()
+        .map(|(id, hash, _)| state.verified_passwords.fingerprint(*id, hash, password));
+    if let (Some((id, _, _)), Some(fp)) = (&found, &fingerprint)
+        && state.verified_passwords.contains(fp)
+        && !state.login_throttle.is_blocked(username, client_ip)
+    {
+        return Ok(AuthUser {
+            id: *id,
             username: username.to_owned(),
         });
     }
@@ -135,6 +228,9 @@ pub async fn authenticate(
     match found {
         Some((id, _, _)) if valid => {
             state.login_throttle.record_success(username, client_ip);
+            if let Some(fp) = fingerprint {
+                state.verified_passwords.insert(fp);
+            }
             Ok(AuthUser {
                 id,
                 username: username.to_owned(),
@@ -223,7 +319,7 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         if let Some((username, password)) = basic_credentials(&parts.headers) {
-            let ip = client_ip(state, &parts.headers, peer_addr(&parts.extensions));
+            let ip = client_ip(state, parts);
             return match authenticate(state, ip, &username, &password, Credentials::AnyPassword)
                 .await
             {

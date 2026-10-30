@@ -13,6 +13,8 @@ use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::{Router, middleware};
+use tower_http::CompressionLevel;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::json::ApiError;
@@ -57,6 +59,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             security::csrf_protection,
         ))
         .layer(middleware::from_fn(security::security_headers))
+        // Only when the client sends `Accept-Encoding: gzip`; full syncs are large
+        // and compress well. The decoded responses are unchanged.
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .quality(CompressionLevel::Fastest),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

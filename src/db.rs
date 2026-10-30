@@ -1,10 +1,11 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use rusqlite::Connection;
 
 /// Schema migrations, applied in order. `PRAGMA user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL UNIQUE,
@@ -61,7 +62,13 @@ CREATE TABLE gpodder_subscriptions (
     user_id    TEXT NOT NULL
 );
 CREATE UNIQUE INDEX subscriptions_url_user ON gpodder_subscriptions (url, user_id);
-"#];
+"#,
+    // Every sync query filters by user first; without these it scans all users' rows.
+    r#"
+CREATE INDEX gpodder_episode_action_user_time ON gpodder_episode_action (user_id, timestamp_epoch);
+CREATE INDEX gpodder_subscriptions_user_updated ON gpodder_subscriptions (user_id, updated);
+"#,
+];
 
 pub struct Db(Mutex<Connection>);
 
@@ -90,7 +97,7 @@ impl Db {
 
     /// Runs `f` with exclusive access to the connection. Never hold this across an `.await`.
     pub fn with<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
-        let mut conn = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut conn)
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Form;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{Extensions, HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -17,7 +17,7 @@ use crate::AppState;
 use crate::auth::{Credentials, authenticate, random_token, session_user};
 use crate::db::now;
 use crate::json::{ApiError, PhpJson};
-use crate::security::{client_ip, peer_addr};
+use crate::security::ClientIp;
 use crate::users::create_app_password;
 
 /// Nextcloud expires login flows after 20 minutes.
@@ -192,15 +192,13 @@ pub struct GrantForm {
 /// request, handing an app password to whoever started the flow.
 pub async fn grant(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    extensions: Extensions,
+    ClientIp(ip): ClientIp,
     Form(form): Form<GrantForm>,
 ) -> Result<Response, ApiError> {
     let Some(client) = pending_flow_client(&state, &form.flow_token)? else {
         return Ok(invalid_flow_page());
     };
 
-    let ip = client_ip(&state, &headers, peer_addr(&extensions));
     let user = match authenticate(
         &state,
         ip,

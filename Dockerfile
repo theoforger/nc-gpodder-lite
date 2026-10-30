@@ -1,5 +1,5 @@
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev gcc g++ make cmake perl
+RUN apk add --no-cache musl-dev gcc
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
