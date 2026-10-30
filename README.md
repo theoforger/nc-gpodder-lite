@@ -17,14 +17,17 @@ cargo build --release
 
 Then open `https://pods.example.com/` to log in and see your subscriptions.
 
-With Docker Compose (publishes `NCGL_PORT`, default `8080`):
+With Docker Compose, configured through a `.env` file:
 
 ```sh
-NCGL_PORT=8080 NCGL_PUBLIC_URL=https://pods.example.com docker compose up -d --build
+cp .env.example .env        # then edit: NCGL_PORT, NCGL_PUBLIC_URL, …
+docker compose up -d --build
 docker compose exec nc-gpodder-lite nc-gpodder-lite user add alice
 ```
 
-The variables can also go in a `.env` file next to `compose.yaml`.
+All settings in `.env` are optional. `NCGL_PORT` is the host port (default `8080`); the
+others are the environment variables listed under [Configuration](#configuration). `.env`
+is ignored by git, so your settings stay local.
 
 With plain Docker:
 
