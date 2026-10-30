@@ -17,7 +17,16 @@ cargo build --release
 
 Then open `https://pods.example.com/` to log in and see your subscriptions.
 
-With Docker:
+With Docker Compose (publishes `NCGL_PORT`, default `8080`):
+
+```sh
+NCGL_PORT=8080 NCGL_PUBLIC_URL=https://pods.example.com docker compose up -d --build
+docker compose exec nc-gpodder-lite nc-gpodder-lite user add alice
+```
+
+The variables can also go in a `.env` file next to `compose.yaml`.
+
+With plain Docker:
 
 ```sh
 docker build -t nc-gpodder-lite .

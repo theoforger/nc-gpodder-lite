@@ -28,3 +28,10 @@ url = "2.5.8"
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tower = "0.5.3"
+
+# The nextcloud-gpodder revision this server is feature-compatible with.
+# Updated by the `sync-upstream` skill (.claude/skills/sync-upstream).
+[package.metadata.upstream]
+repository = "https://github.com/thrillfall/nextcloud-gpodder"
+version = "3.18.0"
+commit = "1f190b3438ec68224eef2635e7d675e564eb8617"
