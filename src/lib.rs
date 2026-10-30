@@ -41,7 +41,7 @@ impl AppState {
 
     /// Base URL of this server as seen by the client, without a trailing slash.
     pub fn base_url(&self, headers: &HeaderMap) -> String {
-        if let Some(url) = &self.config.public_url {
+        if let Some(url) = self.config.public_url.as_deref().filter(|u| !u.is_empty()) {
             return url.trim_end_matches('/').to_owned();
         }
         let header = |name: &str| {
