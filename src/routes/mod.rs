@@ -1,3 +1,4 @@
+mod dashboard;
 mod episode_action;
 mod login_flow;
 mod personal_settings;
@@ -54,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/index.php", nextcloud)
         .route("/status.php", get(status::status))
         .merge(web::router())
+        .merge(dashboard::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security::csrf_protection,

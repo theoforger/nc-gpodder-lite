@@ -15,7 +15,10 @@ cargo build --release
 ./target/release/nc-gpodder-lite serve --public-url https://pods.example.com
 ```
 
-Then open `https://pods.example.com/` to log in and see your subscriptions.
+Then open `https://pods.example.com/` and log in. The **Overview** page shows what your apps
+have synced: episodes played per week, actions by type, top podcasts by listening time, recent
+activity and all subscriptions (each chart can also be shown as a table). **Settings** manages
+subscriptions, app passwords and your password.
 
 With Docker Compose, configured through a `.env` file:
 

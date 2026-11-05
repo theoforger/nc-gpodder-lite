@@ -989,3 +989,63 @@ async fn gzip_is_used_only_when_requested() {
     let gzipped = s.app.clone().oneshot(request(Some("gzip"))).await.unwrap();
     assert_eq!(gzipped.headers()[header::CONTENT_ENCODING], "gzip");
 }
+
+#[tokio::test]
+async fn overview_page_shows_only_the_users_data() {
+    let s = server();
+    let page = |cookie: Option<&str>| {
+        let mut req = Request::get("/dashboard");
+        if let Some(cookie) = cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    assert_eq!(s.send(page(None)).await.status, StatusCode::SEE_OTHER);
+
+    // A feed URL that tries to close the embedded <script> element.
+    let hostile = "https://evil.example/</script><script>alert(1)</script>";
+    s.post_json(
+        &format!("{API}/subscription_change/create"),
+        json!({"add": ["https://alice.example/feed", hostile], "remove": []}),
+    )
+    .await;
+    s.post_json(
+        &format!("{API}/episode_action/create"),
+        json!([action(
+            "https://alice.example/ep1.mp3",
+            "play",
+            "2026-01-01T00:00:00",
+            600
+        )]),
+    )
+    .await;
+    s.post_json_as(
+        &basic("bob", "bob-pw"),
+        &format!("{API}/subscription_change/create"),
+        json!({"add": ["https://bob.example/feed"], "remove": []}),
+    )
+    .await;
+
+    let cookie = s.web_login("alice", "secret-pw").await.unwrap();
+    let res = s.send(page(Some(&cookie))).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.text.contains(r#"https:\/\/alice.example\/feed"#));
+    assert!(!res.text.contains("bob.example"));
+    assert!(!res.text.contains("</script><script>alert"));
+    assert!(
+        res.text
+            .contains(r#"\u003C\/script\u003E\u003Cscript\u003Ealert(1)"#)
+    );
+
+    let start = res.text.find(r#"id="overview-data">"#).unwrap() + r#"id="overview-data">"#.len();
+    let end = start + res.text[start..].find("</script>").unwrap();
+    let data: Value = serde_json::from_str(&res.text[start..end]).unwrap();
+    assert_eq!(data["subscribed"], 2);
+    assert_eq!(data["episodes_played"], 1);
+    assert_eq!(data["listened_seconds"], 600);
+    assert_eq!(data["weeks"].as_array().unwrap().len(), 52);
+    assert_eq!(
+        data["top_podcasts"][0]["url"],
+        "https://example.com/feed.xml"
+    );
+}

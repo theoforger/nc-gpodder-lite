@@ -26,7 +26,7 @@ use crate::users;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(|| async { Redirect::to("/settings") }))
+        .route("/", get(|| async { Redirect::to("/dashboard") }))
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/settings", get(settings_page))
@@ -40,7 +40,7 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// The user logged in to the web UI; requests without a session are redirected
 /// to the login page.
-struct WebUser(AuthUser);
+pub(super) struct WebUser(pub AuthUser);
 
 impl FromRequestParts<Arc<AppState>> for WebUser {
     type Rejection = Redirect;
@@ -53,6 +53,114 @@ impl FromRequestParts<Arc<AppState>> for WebUser {
             .map(WebUser)
             .ok_or_else(|| Redirect::to("/login"))
     }
+}
+
+/// Site-wide styles. Colors are roles (CSS custom properties) with separately
+/// chosen light and dark values from the data-viz reference palette.
+const STYLE: &str = r#"
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --wash: #f0efec;
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+  --other: #898781; --track: #cde2fb; --critical: #d03b3b;
+  --on-series-1: #fff; --on-series-2: #fff; --on-series-3: #fff; --on-series-4: #0b0b0b; --on-other: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: #2c2c2a;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --other: #6b6a66; --track: #104281; --critical: #e66767;
+    --on-series-4: #fff;
+  }
+}
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 64rem; margin: 2rem auto;
+  padding: 0 1rem; color: var(--ink); background: var(--page); }
+h1 { font-size: 1.5rem; } h2 { font-size: 1.15rem; margin: 2rem 0 0.75rem; }
+a { color: var(--series-1); }
+form { margin: 0.5rem 0; }
+label { display: block; margin: 0.5rem 0; }
+input { padding: 0.3rem; font: inherit; }
+button { padding: 0.3rem 0.8rem; font: inherit; cursor: pointer; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.4rem; border-bottom: 1px solid var(--grid); vertical-align: top; }
+th { color: var(--ink-2); font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.podcast { display: flex; gap: 0.75rem; align-items: flex-start; }
+.podcast img { width: 3rem; height: 3rem; object-fit: cover; border-radius: 4px; }
+.muted { color: var(--ink-2); font-size: 0.9em; overflow-wrap: anywhere; }
+.error { color: var(--critical); } .notice { background: var(--wash); padding: 0.75rem; border-radius: 4px; }
+code { background: var(--wash); padding: 0.1rem 0.3rem; border-radius: 3px; overflow-wrap: anywhere; }
+header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+nav.site { display: flex; gap: 1.25rem; align-items: center; }
+nav.site a { text-decoration: none; color: var(--ink-2); padding-bottom: 2px; }
+nav.site a[aria-current="page"] { color: var(--ink); border-bottom: 2px solid var(--series-1); }
+.account { display: flex; gap: 0.75rem; align-items: center; }
+.account form { margin: 0; }
+
+/* Overview page */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.75rem; }
+.tile, .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; }
+.tile { padding: 0.9rem 1rem; }
+.tile .label { color: var(--ink-2); font-size: 0.85rem; }
+.tile .value { font-size: 1.6rem; font-weight: 600; margin-top: 0.2rem; }
+.tile .sub { color: var(--ink-2); font-size: 0.8rem; margin-top: 0.15rem; }
+.card { padding: 1rem 1.25rem; margin-top: 0.75rem; }
+.card h2 { margin: 0; font-size: 1rem; }
+.card .caption { color: var(--ink-2); font-size: 0.85rem; margin: 0.2rem 0 0.75rem; }
+.card details { margin-top: 0.75rem; }
+.card summary { color: var(--ink-2); font-size: 0.85rem; cursor: pointer; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart svg:focus-visible, .seg-block:focus-visible, .hbar-row:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.seg { display: flex; gap: 2px; height: 28px; }
+.seg-block { border-radius: 4px; display: flex; align-items: center; padding: 0 6px; min-width: 0;
+  font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
+.seg-block:hover, .hbar-row:hover .hbar { filter: brightness(1.12); }
+.legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.6rem; font-size: 0.85rem; color: var(--ink-2); }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  margin-right: 0.35rem; background: var(--swatch); vertical-align: -1px; }
+.hbar-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.2rem; padding: 0.35rem 0; }
+.hbar-name { font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar-line { display: flex; align-items: center; gap: 0.5rem; }
+.hbar { height: 12px; background: var(--series-1); border-radius: 0 4px 4px 0; min-width: 2px; }
+.hbar-value { font-size: 0.85rem; color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.meter { width: 6rem; height: 4px; border-radius: 2px; background: var(--track); overflow: hidden; display: inline-block;
+  vertical-align: middle; margin-right: 0.5rem; }
+.meter > i { display: block; height: 100%; background: var(--series-1); border-radius: 2px; }
+.dot::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 0.4rem; background: var(--swatch); }
+.tooltip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.85rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+.tooltip strong { display: block; font-size: 0.95rem; }
+.tooltip span { color: var(--ink-2); }
+.empty { color: var(--ink-2); padding: 1rem 0; }
+.scroll { overflow-x: auto; }
+td.nowrap { white-space: nowrap; }
+td.episode { white-space: nowrap; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; }
+"#;
+
+/// Navigation shown on pages for logged-in users.
+pub fn user_nav(user: &AuthUser, active: &str) -> String {
+    let link = |href: &str, label: &str| {
+        let current = if href == active {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
+        format!(r#"<a href="{href}"{current}>{label}</a>"#)
+    };
+    format!(
+        r#"<header><nav class="site">{overview}{settings}</nav>
+<div class="account"><span class="muted">{username}</span>
+<form method="post" action="/logout"><button type="submit">Log out</button></form></div></header>"#,
+        overview = link("/dashboard", "Overview"),
+        settings = link("/settings", "Settings"),
+        username = esc(&user.username),
+    )
 }
 
 pub fn esc(s: &str) -> String {
@@ -83,22 +191,7 @@ pub fn page(title: &str, body: &str, script: Option<&str>) -> Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="same-origin">
 <title>{title} · nc-gpodder-lite</title>
-<style nonce="{nonce}">
-body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #222; }}
-h1 {{ font-size: 1.5rem; }} h2 {{ font-size: 1.2rem; margin-top: 2rem; }}
-form {{ margin: 0.5rem 0; }}
-label {{ display: block; margin: 0.5rem 0; }}
-input {{ padding: 0.3rem; font: inherit; }}
-button {{ padding: 0.3rem 0.8rem; font: inherit; cursor: pointer; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ text-align: left; padding: 0.4rem; border-bottom: 1px solid #ddd; vertical-align: top; }}
-.podcast {{ display: flex; gap: 0.75rem; align-items: flex-start; }}
-.podcast img {{ width: 3rem; height: 3rem; object-fit: cover; border-radius: 4px; }}
-.muted {{ color: #666; font-size: 0.9em; overflow-wrap: anywhere; }}
-.error {{ color: #b00020; }} .notice {{ background: #eef6ee; padding: 0.75rem; border-radius: 4px; }}
-code {{ background: #f3f3f3; padding: 0.1rem 0.3rem; border-radius: 3px; overflow-wrap: anywhere; }}
-header {{ display: flex; justify-content: space-between; align-items: center; }}
-</style>
+<style nonce="{nonce}">{STYLE}</style>
 </head>
 <body>
 <h1>{title}</h1>
@@ -107,6 +200,7 @@ header {{ display: flex; justify-content: space-between; align-items: center; }}
 </body>
 </html>"#,
         title = esc(title),
+        STYLE = STYLE,
     ));
     let csp = HeaderValue::from_str(&csp).expect("CSP is a valid header value");
     ([(header::CONTENT_SECURITY_POLICY, csp)], html).into_response()
@@ -145,7 +239,7 @@ fn login_error_page(err: &LoginError) -> Response {
 
 async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if session_user(&state, &headers).is_some() {
-        return Redirect::to("/settings").into_response();
+        return Redirect::to("/dashboard").into_response();
     }
     login_form(None).into_response()
 }
@@ -194,7 +288,7 @@ async fn login(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
         SESSION_LIFETIME_SECS
     );
-    let mut res = Redirect::to("/settings").into_response();
+    let mut res = Redirect::to("/dashboard").into_response();
     res.headers_mut()
         .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     Ok(res)
@@ -314,8 +408,7 @@ fn render_settings(
         .map(|n| format!(r#"<div class="notice">{n}</div>"#))
         .unwrap_or_default();
     let body = format!(
-        r#"<header><span>Logged in as <strong>{username}</strong></span>
-<form method="post" action="/logout"><button type="submit">Log out</button></form></header>
+        r#"{nav}
 {notice}
 <p class="muted">Server address for podcast apps (Nextcloud sync): <code>{base}</code></p>
 
@@ -342,7 +435,7 @@ fn render_settings(
 <label>New password <input name="new" type="password" autocomplete="new-password" required minlength="8"></label>
 <button type="submit">Change password</button>
 </form>"#,
-        username = esc(&user.username),
+        nav = user_nav(user, "/settings"),
         base = esc(&state.base_url(headers)),
     );
     Ok(page("Podcast sync", &body, Some(SETTINGS_SCRIPT)))
